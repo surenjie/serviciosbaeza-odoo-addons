@@ -26,7 +26,7 @@ class RenewWizard(models.TransientModel):
         string='Comments', size=200, help='Renewal comments')
 
     @api.multi
-    def create_renewal(self, cr, uid, ids, context=None):
+    def create_renewal(self, context=None):
         """It creates agreement renewal records with data given in this wizard.
         """
         self.ensure_one()

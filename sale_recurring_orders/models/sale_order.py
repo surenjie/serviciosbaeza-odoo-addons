@@ -58,3 +58,20 @@ class SaleOrder(models.Model):
     from_agreement = fields.Boolean(
         string='From agreement?', copy=False,
         help='This field indicates if the sale order comes from an agreement.')
+    agreement_id = fields.Many2one(
+        comodel_name='sale.recurring_orders.agreement',
+        string='Agreement reference', ondelete='restrict')
+
+    @api.multi
+    def view_order(self):
+        """Method for viewing orders associated to an agreement"""
+        return {
+            'view_type': 'form',
+            'view_mode': 'form',
+            'res_model': 'sale.order',
+            'context': self.env.context,
+            'res_id': self[:1].id,
+            'view_id': [self.env.ref('sale.view_order_form').id],
+            'type': 'ir.actions.act_window',
+            'nodestroy': True
+        }

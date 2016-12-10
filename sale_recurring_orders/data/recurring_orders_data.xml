@@ -2,12 +2,6 @@
 <openerp>
 	<data noupdate="1">
 	
-		<!-- Sequence type for agreement -->
-		<record model="ir.sequence.type" id="seq_type_ro_agreement">
-			<field name="name">Agreement sequence</field>
-			<field name="code">sale.r_o.agreement.sequence</field>
-		</record>
-
 		<!--Sequence for agreement -->
 		<record model="ir.sequence" id="seq_ro_agreement">
 			<field name="name">Agreement sequence</field>

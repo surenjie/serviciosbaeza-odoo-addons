@@ -106,8 +106,8 @@ class Agreement(models.Model):
         comodel_name='sale.recurring_orders.agreement.line',
         inverse_name='agreement_id', string='Agreement lines')
     order_line = fields.One2many(
-        comodel_name='sale.recurring_orders.agreement.order', copy=False,
-        inverse_name='agreement_id', string='Order lines', readonly=True)
+        comodel_name='sale.order', copy=False, inverse_name='agreement_id',
+        string='Orders', readonly=True)
     renewal_line = fields.One2many(
         comodel_name='sale.recurring_orders.agreement.renewal', copy=False,
         inverse_name='agreement_id', string='Renewal lines', readonly=True)
@@ -157,7 +157,7 @@ class Agreement(models.Model):
     @api.multi
     def write(self, vals):
         value = super(Agreement, self).write(vals)
-        if (any(vals.get(x, []) is not [] for x in
+        if (any(vals.get(x) is not None for x in
                 ['active', 'number', 'agreement_line', 'prolong', 'end_date',
                  'prolong_interval', 'prolong_unit', 'partner_id'])):
             # unlink all future orders
@@ -196,11 +196,11 @@ class Agreement(models.Model):
 
     @api.model
     def revise_agreements_expirations_planned(self):
-        """Check each active agreement to see if the end is near."""
-        agreements = self.search(
-            [('next_expiration_date', '<=', fields.Date.today())])
-        # force recalculate next_expiration_date
-        agreements.write({'prolong': 'unlimited'})
+        """Check each active unlimited agreement to see if the end is near."""
+        for agreement in self.search([('prolong', '=', 'unlimited')]):
+            if agreement.next_expiration_date <= fields.Date.today():
+                # force recalculate next_expiration_date
+                agreement.write({'prolong': 'unlimited'})
         return True
 
     @api.model
@@ -209,16 +209,13 @@ class Agreement(models.Model):
             company_id=agreement.company_id.id)
         order_vals = {
             'date_order': date,
-            'date_confirm': date,
             'origin': agreement.number,
             'partner_id': agreement.partner_id.id,
             'state': 'draft',
             'company_id': agreement.company_id.id,
             'from_agreement': True,
+            'agreement_id': agreement.id,
         }
-        # Get other order values from agreement partner
-        order_vals.update(order_obj.onchange_partner_id(
-            agreement.partner_id.id)['value'])
         order_vals['user_id'] = agreement.partner_id.user_id.id
         return order_vals
 
@@ -232,20 +229,8 @@ class Agreement(models.Model):
             'product_uom_qty': agreement_line.quantity,
             'discount': agreement_line.discount,
         }
-        # get other order line values from agreement line product
-        order_line_vals.update(order_line_obj.product_id_change(
-            order.pricelist_id.id, product=agreement_line.product_id.id,
-            qty=agreement_line.quantity,
-            partner_id=self.partner_id.id,
-            fiscal_position=1 or order.fiscal_position.id)['value'])
         if agreement_line.specific_price:
             order_line_vals['price_unit'] = agreement_line.specific_price
-        # Put line taxes
-        order_line_vals['tax_id'] = [(6, 0, tuple(order_line_vals['tax_id']))]
-        # Put custom description
-        if agreement_line.additional_description:
-            order_line_vals['name'] += " %s" % (
-                agreement_line.additional_description)
         return order_line_vals
 
     @api.multi
@@ -256,29 +241,27 @@ class Agreement(models.Model):
         @param agreement_lines: Lines that will generate order lines.
         """
         self.ensure_one()
-        order_obj = self.env['sale.order'].with_context(
-            company_id=self.company_id.id)
         order_line_obj = self.env['sale.order.line'].with_context(
             company_id=self.company_id.id)
         order_vals = self._prepare_sale_order_vals(self, date)
-        order = order_obj.create(order_vals)
+        order = self.env['sale.order'].create(order_vals)
+        # Get other order values from agreement partner
+        order.onchange_partner_id()
         # Create order lines objects
         for agreement_line in agreement_lines:
             order_line_vals = self._prepare_sale_order_line_vals(
                 agreement_line, order)
-            order_line_obj.create(order_line_vals)
+            order_line_rec = order_line_obj.create(order_line_vals)
+            # get other order line values from agreement line product
+            order_line_rec.product_id_change()
+            # Put custom description
+            if agreement_line.additional_description:
+                order_line_rec.name += " %s" % agreement_line.additional_description
         # Update last order date for lines
         agreement_lines.write({'last_order_date': fields.Date.today()})
         # Update agreement state
         if self.state != 'orders':
-            self.write({'state': 'orders'})
-        # Create order agreement record
-        agreement_order_vals = {
-            'agreement_id': self.id,
-            'order_id': order.id,
-        }
-        self.env['sale.recurring_orders.agreement.order'].create(
-            agreement_order_vals)
+            self.state = 'orders'
         return order
 
     @api.multi
@@ -324,12 +307,14 @@ class Agreement(models.Model):
         # Order all pending lines
         dates = lines_to_order.keys()
         dates.sort()
-        agreement_order_obj = self.env['sale.recurring_orders.agreement.order']
         for date in dates:
             # Check if an order exists for that date
-            if not len(agreement_order_obj.search(
-                    [('date', '=', fields.Date.to_string(date)),
-                     ('agreement_id', '=', self['id'])])):
+            order = self.order_line.filtered(
+                lambda x: (
+                    fields.Date.to_string(
+                        fields.Datetime.from_string(x.date_order)) ==
+                    fields.Date.to_string(date)))
+            if not order:
                 # create it if not exists
                 self.create_order(
                     fields.Date.to_string(date), lines_to_order[date])
@@ -341,31 +326,29 @@ class Agreement(models.Model):
         self.ensure_one()
         # Add only active lines
         agreement_lines = self.mapped('agreement_line').filtered('active_chk')
-        order_id = self.create_order(self.start_date, agreement_lines)
-        # Update agreement state
+        order = self.create_order(self.start_date, agreement_lines)
         self.write({'state': 'first'})
-        # Confirm order
-        workflow.trg_validate(
-            self.env.uid, 'sale.order', order_id, 'order_confirm', self.env.cr)
-        # Get view to show
-        view = self.env.ref('sale.view_order_form')
+        order.signal_workflow('order_confirm')
         # Return view with order created
         return {
-            'domain': "[('id', '=', %s)]" % order_id,
+            'domain': "[('id', '=', %s)]" % order.id,
             'view_type': 'form',
             'view_mode': 'form',
             'res_model': 'sale.order',
             'context': self.env.context,
-            'res_id': order_id,
-            'view_id': [view.id],
+            'res_id': order.id,
+            'view_id': [self.env.ref('sale.view_order_form').id],
             'type': 'ir.actions.act_window',
             'nodestroy': True
         }
 
     @api.model
-    def generate_next_orders_planned(self, years=1):
+    def generate_next_orders_planned(self, years=1, start_date=None):
         """Launch the order generation of active agreements."""
-        self.search([]).generate_next_orders(years=years)
+        if start_date:
+            start_date = fields.Date.from_string(start_date)
+        self.search([]).generate_next_orders(
+            years=years, start_date=start_date)
 
     @api.multi
     def generate_next_year_orders(self):
@@ -385,18 +368,22 @@ class Agreement(models.Model):
 
     @api.model
     def confirm_current_orders_planned(self):
-        orders = self.search([]).mapped('order_line').filtered(
-            lambda x: not x.confirmed and x.date <= fields.Date.today())
+        tomorrow = fields.Date.to_string(
+            fields.Date.from_string(fields.Date.today()) + timedelta(days=1))
+        orders = self.env['sale.order'].search([
+            ('agreement_id', '!=', False),
+            ('state', 'in', ('draft', 'sent')),
+            ('date_order', '<', tomorrow)
+        ])
         for order in orders:
-            workflow.trg_validate(
-                self.env.uid, 'sale.order', order.id, 'order_confirm',
-                self.env.cr)
+            order.signal_workflow('order_confirm')
 
     @api.multi
     def unlink_orders(self, start_date):
         """Remove generated orders from given date."""
         orders = self.mapped('order_line').filtered(
-            lambda x: not x.confirmed and x.date >= start_date)
+            lambda x: (x.state in ('draft', 'sent') and
+                       x.date_order >= start_date))
         orders.unlink()
 
 
@@ -455,44 +442,6 @@ class AgreementLine(models.Model):
             if product:
                 result['value'] = {'name': product['name']}
         return result
-
-
-# TODO: Impedir que se haga doble clic sobre el registro order
-class AgreementOrder(models.Model):
-    """Class for recording each order created for each line of the agreement.
-    It keeps only reference to the agreement, not to the line.
-    """
-    _name = 'sale.recurring_orders.agreement.order'
-
-    @api.multi
-    def _compute_confirmed(self):
-        for record in self:
-            record.confirmed = record.order_id.state != 'draft'
-
-    agreement_id = fields.Many2one(
-        comodel_name='sale.recurring_orders.agreement',
-        string='Agreement reference', ondelete='cascade')
-    order_id = fields.Many2one(
-        comodel_name='sale.order', string='Order', ondelete='cascade')
-    date = fields.Datetime(
-        related="order_id.date_order", string="Order date", store=False)
-    confirmed = fields.Boolean(compute="_compute_confirmed", store=False)
-
-    @api.multi
-    def view_order(self):
-        """Method for viewing orders associated to an agreement"""
-        self.ensure_one()
-        view = self.env.ref('sale.view_order_form')
-        # Return view with order created
-        return {
-            'view_type': 'form',
-            'view_mode': 'form',
-            'res_model': 'sale.order',
-            'res_id': self.order_id.id,
-            'view_id': [view.id],
-            'type': 'ir.actions.act_window',
-            'nodestroy': True
-        }
 
 
 class AgreementRenewal(models.Model):
